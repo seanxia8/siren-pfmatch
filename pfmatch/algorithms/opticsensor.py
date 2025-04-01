@@ -1,5 +1,6 @@
 from scipy.special import erf
-
+import torch
+import numpy as np
 
 def PMT_PEPC_general(x: torch.Tensor, **kwargs):
     '''
@@ -47,7 +48,7 @@ def PMT_TTS_general(x: torch.Tensor, **kwargs):
 
     profile = tts_lambda / 2 * torch.exp(tts_lambda / 2 * (2 * tts_mean + tts_lambda * tts_sig ** 2 - 2 * x)) * \
               (1 - erf((tts_mean + tts_lambda * tts_sig ** 2 - x) / (np.sqrt(2) * tts_sig)))
-    profile /= torch.sum(profile, dim=1, keepdim=True) * (x[0, 1] - x[0, 0])
+    profile /= torch.sum(profile, dim=2, keepdim=True) * (x[0, 0, 1] - x[0, 0, 0])
     return profile
 
 
@@ -91,7 +92,7 @@ def compute_probability_at_x(x: torch.Tensor, profile: torch.Tensor):
     return prob_at_x
 
 
-class square_steel_PMT():
+class dot_steel_PMT():
     def __init__(self, cfg: dict):
         """
         Calculates the sensor response from a photon at `time_tick` relative to the PE time
@@ -105,7 +106,7 @@ class square_steel_PMT():
         self.pmt_pepc = cfg.get('pmt_pepc', 'general')
         self.pmt_ang_eff = cfg.get('pmt_ang_eff', 'general')
         self.pmt_tts = cfg.get('pmt_tts', 'general')
-        self.t_threshold = cfg.get('t_threshold', 0.1)
+        self.t_threshold = cfg.get('t_threshold', 0.05)
         self.n_PE = None
         self.pmt_eff = None
 
@@ -144,8 +145,8 @@ class square_steel_PMT():
         """
         if self.pmt_pepc == 'general':
             q_axis = torch.linspace(0, self.charge_max, self.charge_resolution).unsqueeze(0).tile(self.n_PE.shape[1], 1)
-            profile = PMT_PEPC_general(q_axis, **kwargs)
-            prob_at_q = compute_probability_at_x(q_axis, profile)
+            profile_q = PMT_PEPC_general(q_axis, **kwargs)
+            prob_at_q = compute_probability_at_x(q_axis, profile_q)
         else:
             raise ValueError(f"Unknown pmt_pepc: {self.pmt_pepc}")
 
@@ -159,8 +160,9 @@ class square_steel_PMT():
         for i, nPE in enumerate(self.n_PE):
             if self.hit_mask[i].sum() > 1:
                 for j, n in enumerate(nPE):
+                    if int(n) == 0: continue
                     indices = torch.searchsorted(prob_at_q[j], rand_vals[i, j, :int(n)])
-                    padded_q[i, j, :len(indices)] = profile[j][indices]
+                    padded_q[i, j, :len(indices)] = profile_q[j][indices]
         sum_q = torch.sum(padded_q, dim=2)
         return padded_q, sum_q
 
@@ -178,26 +180,29 @@ class square_steel_PMT():
 
         if self.pmt_tts == 'general':
             t_axis = torch.linspace(self.time_min, self.time_max, self.time_resolution).unsqueeze(0).tile(
-                self.n_PE.shape[1], 1)
+                self.n_PE.shape[0],
+                self.n_PE.shape[1],
+                1)
             t_axis += mean_time
-            profile = PMT_TTS_general(t_axis, time_mean=mean_time)
-            prob_at_t = compute_probability_at_x(t_axis, profile)
+            profile_t = PMT_TTS_general(t_axis, time_mean=mean_time)
+            prob_at_t = torch.stack([compute_probability_at_x(t_axis[i], profile_t[i]) for i in range(t_axis.shape[0])])
         else:
             raise ValueError(f"Unknown pmt_tts: {self.pmt_tts}")
 
         # Generate random numbers between 0 and 1 for each `pe`
         rand_vals = torch.rand((self.n_PE.shape[0], self.n_PE.shape[1], self.max_n))
         padded_t = torch.full((self.n_PE.shape[0], self.n_PE.shape[1], self.max_n), -999, dtype=torch.float)
-
-        mask_t_threshold = prob_at_t > self.t_threshold
+        #mask_t_threshold = prob_at_t > self.t_threshold
         # Find indices where rand_vals fall in `prob_at_t`
         for i, nPE in enumerate(self.n_PE):
             if self.hit_mask[i].sum() > 0:
                 for j, n in enumerate(nPE):
-                    assert torch.sum(mask_t_threshold[j]) > 0, "No time values above threshold"
-                    indices = torch.searchsorted(prob_at_t[j] * mask_t_threshold[j], rand_vals[i, j, :int(n)])
-                    padded_t[i, j, :len(indices)] = profile[j][indices]
-        mask_0 = padded_t > -999
+                    if int(n) == 0: continue
+                    #assert torch.sum(mask_t_threshold[i,j]) > 0, "No time values above threshold"
+                    #indices = torch.searchsorted(prob_at_t[i,j][mask_t_threshold[i,j]], rand_vals[i, j, :int(n)])
+                    indices = torch.searchsorted(prob_at_t[i, j], rand_vals[i, j, :int(n)])
+                    padded_t[i, j, :len(indices)] = profile_t[i, j, indices]
 
-        first_t = torch.min(padded_t * mask_0, dim=1).values
+        mask_0 = padded_t > -999
+        first_t = torch.min(padded_t * mask_0, dim=2).values
         return padded_t, first_t
